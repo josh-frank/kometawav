@@ -38,9 +38,10 @@ BLOCK        = SYNC_BITS + DATA_BITS
 REDUNDANCY   = {"low": 256, "medium": 512, "high": 1024}   # samples per bit
 DEFAULT_BAND = (300.0, 2700.0)
 DEFAULT_STRENGTH_DB = 18.0                # watermark this far below the cover
-HDR_BYTES    = 9                          # len(1) + salt(8)
+LEN_BYTES    = 8                          # length field width (big-endian uint)
+SALT_BYTES   = 8
+HDR_BYTES    = LEN_BYTES + SALT_BYTES     # len(8) + salt(8)
 TAG_BYTES    = 16
-MAX_MSG      = 255
 ENV_WIN      = 400                        # 50 ms @ 8 kHz
 ENV_FLOOR    = 0.1                        # envelope floor, fraction of global RMS
 SYNC_Z       = 7.0                        # sync detection threshold (std devs)
@@ -211,13 +212,26 @@ def plan(n):
     return data, blocks, data + SYNC_BITS * blocks
 
 def capacity_bytes(n_samples_8k, L):
-    best = -1
-    for n in range(0, MAX_MSG + 1):
-        if plan(n)[2] * L <= n_samples_8k:
-            best = n
+    """Largest n (bytes) such that plan(n)'s symbol count fits in n_samples_8k
+    samples at L samples/bit. positions(n) is strictly increasing in n (it
+    grows by ~16 coded bits per payload byte), so exponential search for an
+    upper bound followed by binary search finds it in O(log n) calls to
+    plan(), with no fixed ceiling on message size."""
+    def fits(n):
+        return plan(n)[2] * L <= n_samples_8k
+
+    if not fits(0):
+        return -1
+    lo, hi = 0, 1
+    while fits(hi):
+        lo, hi = hi, hi * 2
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(mid):
+            lo = mid
         else:
-            break
-    return best
+            hi = mid - 1
+    return lo
 
 def msg_key(password, salt):
     return hashlib.scrypt(password.encode(), salt=salt, n=KDF_N, r=8, p=1, dklen=32)
@@ -234,8 +248,6 @@ def build_symbols(data_bits, sw):
 
 def encode_audio(cover, fs, message, password, redundancy="medium",
                  strength_db=DEFAULT_STRENGTH_DB, band=DEFAULT_BAND):
-    if len(message) > MAX_MSG:
-        raise KometaError(f"message is {len(message)} bytes; the maximum is {MAX_MSG}")
     if fs < WORK_FS:
         raise KometaError(f"cover sample rate {fs} Hz is below {WORK_FS} Hz")
     L = REDUNDANCY[redundancy]
@@ -252,8 +264,8 @@ def encode_audio(cover, fs, message, password, redundancy="medium",
             f"(capacity here: {max(cap, 0)} bytes)")
 
     # frame: [len][salt] in the clear (but FEC'd), then ciphertext+tag
-    salt = os.urandom(8)
-    header = bytes([n]) + salt
+    salt = os.urandom(SALT_BYTES)
+    header = n.to_bytes(LEN_BYTES, "big") + salt
     ct = ChaCha20Poly1305(msg_key(password, salt)).encrypt(bytes(12), message, header)
     ck = carrier_key(password)
     data_bits = np.concatenate([fec_encode(header, ck, b"perm-hdr"),
@@ -416,7 +428,16 @@ def _sync_candidates(xn, pa, sw, L, max_freq, log):
 def _try(xs, pa, sw, L, lag, ck, password, log):
     dm = _Demod(xs, pa, sw, L, lag)
     hdr = fec_decode(dm.get(hdr_coded_bits()), ck, b"perm-hdr")
-    n, salt = hdr[0], hdr[1:HDR_BYTES]
+    n, salt = int.from_bytes(hdr[:LEN_BYTES], "big"), hdr[LEN_BYTES:HDR_BYTES]
+    # A wrong sync candidate (wrong password/offset/frequency) can decode the
+    # header to a garbage length. With a single-byte length field that used to
+    # be capped at 255; now it can be astronomically large, and
+    # pay_coded_bits(n) would then ask for an impossibly large soft-bit array.
+    # Bound n by what could possibly still fit in the remaining audio and bail
+    # out early (as just another failed candidate) rather than crash.
+    max_bits = (max(0, len(xs) - lag) // L + 1) * DATA_BITS
+    if pay_coded_bits(n) > max_bits:
+        return None
     soft = dm.get(hdr_coded_bits() + pay_coded_bits(n))[hdr_coded_bits():]
     ct = fec_decode(soft, ck, b"perm-pay")
     if dm.anchors:
